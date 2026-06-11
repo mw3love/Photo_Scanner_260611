@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 변환 결과물(원본 옆에 생성됨)
+_scanned/
+
+# Windows / Google Drive 시스템 파일
+desktop.ini
+Thumbs.db
+
+# 임시 검증 산출물
+_*.png
