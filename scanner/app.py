@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import sys
 
@@ -110,6 +111,28 @@ def make_thumb(bgr: np.ndarray, s: int = 64) -> QtGui.QIcon:
     small = cv2.resize(bgr, (max(1, int(w * sc)), max(1, int(h * sc))),
                        interpolation=cv2.INTER_AREA)
     return QtGui.QIcon(bgr_to_qpixmap(small))
+
+
+def warp_for_thumb(bgr: np.ndarray, quad: np.ndarray,
+                   max_dim: int = 320) -> np.ndarray:
+    """썸네일용 보정 결과(빠름). 큰 원본은 줄여서 warp. quad 는 원본 좌표계."""
+    h, w = bgr.shape[:2]
+    sc = min(1.0, max_dim / float(max(h, w)))
+    if sc < 1.0:
+        small = cv2.resize(bgr, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+        return warp(small, np.asarray(quad, np.float32) * sc)
+    return warp(bgr, quad)
+
+
+def _session_path() -> str:
+    """세션 저장 경로(사용자 AppData 하위). Google Drive 동기 폴더가 아닌
+    로컬 사용자 영역에 둬 동기화 충돌·지연을 피한다."""
+    base = QtCore.QStandardPaths.writableLocation(
+        QtCore.QStandardPaths.StandardLocation.AppDataLocation)
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".photo_scanner")
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "session.json")
 
 
 def emoji_icon(ch: str, px: int = 20) -> QtGui.QIcon:
@@ -242,7 +265,7 @@ class ScanView(QtWidgets.QGraphicsView):
         self.on_quad_changed = lambda: None        # 윈도우가 주입(미리보기 갱신)
         self.on_prev = lambda: None                # 좌우 화살표 → 윈도우가 주입
         self.on_next = lambda: None
-        self.loupe_enabled = True
+        self.loupe_enabled = False
         self._loupe = QtWidgets.QLabel(self.viewport())
         self._loupe.setFixedSize(180, 180)
         self._loupe.setStyleSheet(
@@ -537,7 +560,7 @@ class HtmlDelegate(QtWidgets.QStyledItemDelegate):
 
 class Page:
     __slots__ = ("path", "quad", "confirmed", "thumb", "label",
-                 "sharpen", "contrast", "gray")
+                 "sharpen", "contrast", "gray", "rotate")
 
     def __init__(self, path: str):
         self.path = path
@@ -548,6 +571,7 @@ class Page:
         self.sharpen = False            # 사진별 보정 옵션(개별)
         self.contrast = False
         self.gray = False
+        self.rotate = 0                 # 출력물 회전(시계방향 90° 단위, 0~3)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -558,6 +582,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pages: list[Page] = []
         self.idx = -1
         self._loading = False
+        self._touched = False            # 현재 사진의 모서리를 사용자가 실제로 만졌는가
 
         # 좌: 썸네일 목록
         self.listw = QtWidgets.QListWidget()
@@ -580,14 +605,24 @@ class MainWindow(QtWidgets.QMainWindow):
         left_box.setStyleSheet(self.LEFT_QSS)
         # 표식 필터 — 토글 버튼 OR(여러 표식 동시 표시). 기본 모두 켬=전체.
         filt_grp = QtWidgets.QGroupBox("표식 필터")
-        fl = QtWidgets.QHBoxLayout(filt_grp)
-        fl.setContentsMargins(8, 4, 8, 8)
+        fv = QtWidgets.QVBoxLayout(filt_grp)
+        fv.setContentsMargins(8, 4, 8, 8)
+        fv.setSpacing(4)
+        # 원클릭 전체표시(필터 초기화) — 필터 묶음 맨 위에 둬 '전체 선택'과 구분
+        self.btn_filt_reset = QtWidgets.QPushButton("필터 전체표시")
+        self.btn_filt_reset.setToolTip("인식·미인식·확인 필터를 모두 켜서 전체 표시로 초기화")
+        self.btn_filt_reset.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_filt_reset.clicked.connect(self._reset_filters)
+        fv.addWidget(self.btn_filt_reset)
+        # 3개 표식 토글
+        fl = QtWidgets.QHBoxLayout()
         fl.setSpacing(4)
         self.cb_f_fail = self._make_filter_btn("? 미인식", "자동인식 실패만 모아 빠르게 처리")
         self.cb_f_det = self._make_filter_btn("• 인식", "인식됨(미확인) — 결과 빠른 검토")
         self.cb_f_conf = self._make_filter_btn("✓ 확인", "확인 완료 — 2차 검증")
         for b in (self.cb_f_fail, self.cb_f_det, self.cb_f_conf):
             fl.addWidget(b)
+        fv.addLayout(fl)
         # 전체선택/해제 토글
         self.btn_all = QtWidgets.QPushButton("전체 선택")
         self.btn_all.setCheckable(True)
@@ -598,7 +633,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lv.addWidget(self.listw, 1)
         # 중앙: 캔버스
         self.view = ScanView()
-        self.view.on_quad_changed = self.update_preview
+        self.view.on_quad_changed = self._on_quad_changed
         self.view.setAcceptDrops(False)  # 드롭은 메인 윈도우가 받는다(아래 dropEvent)
         # 우: 실시간 미리보기
         prev_box = QtWidgets.QWidget()
@@ -626,7 +661,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # 하단 조작 안내바
         self.helpbar = QtWidgets.QLabel(
             "  F: 화면에 맞춤   ·   Enter: 수정완료+다음   ·   ← →: 이전/다음   ·   "
-            "F2: 이름변경   ·   Del: 목록제거   ·   1·2·3: 샤프닝·명암·흑백")
+            "F2: 이름변경   ·   Del: 목록제거   ·   1·2·3: 샤프닝·명암·흑백   ·   "
+            "4·5: 회전")
         self.helpbar.setStyleSheet("background:#252525; color:#9a9a9a; padding:4px;")
 
         container = QtWidgets.QWidget()
@@ -690,6 +726,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # 1) 열기 (일회성: 대화상자 팝업)
         act(emoji_icon("🖼️"), "사진 열기", self.open_files, "사진 파일 선택(여러 장 가능)")
         act(emoji_icon("📁"), "폴더 열기", self.open_folder, "폴더 안 이미지 전부 열기")
+        act(emoji_icon("🗑"), "새로 시작", self._new_session,
+            "현재 목록을 비우고 새 작업 시작(다음 실행 시 복원 안 함)")
         tb.addSeparator()
         # 2) 탐색 (일회성: 즉시 동작)
         act(SP.SP_ArrowLeft, "이전", self.prev, "이전 사진 (←)")
@@ -702,11 +740,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "현재 사진 파일명 직접 변경 (F2)")
         tb.addSeparator()
         # 3) 조정 도구 (일회성 + 토글 혼합)
+        act(emoji_icon("↺"), "왼쪽 회전", lambda: self.rotate_selected(-1),
+            "선택한 사진들의 출력물을 90° 반시계 회전 (4)")
+        act(emoji_icon("↻"), "오른쪽 회전", lambda: self.rotate_selected(1),
+            "선택한 사진들의 출력물을 90° 시계 회전 (5)")
         act(SP.SP_BrowserReload, "자동 재인식", self.redetect, "이 사진에서 사각형 다시 찾기")
         act(SP.SP_FileDialogListView, "화면에 맞춤", self.view.reset_fit, "화면에 맞춤 (F/더블클릭)")
-        self.act_loupe = QtGui.QAction(std(SP.SP_FileDialogContentsView), "돋보기: 켬", self)
+        self.act_loupe = QtGui.QAction(std(SP.SP_FileDialogContentsView), "돋보기: 끔", self)
         self.act_loupe.setCheckable(True)
-        self.act_loupe.setChecked(True)
+        self.act_loupe.setChecked(False)
         self.act_loupe.setToolTip("모서리 주변 확대 표시 켜기/끄기 (상태 유지 토글)")
         self.act_loupe.toggled.connect(self._loupe_toggled)
         tb.addAction(self.act_loupe)
@@ -718,11 +760,54 @@ class MainWindow(QtWidgets.QMainWindow):
             "이 사진을 수정완료로 표시 / 다시 누르면 해제 (Enter = 수정완료+다음)")
         self.act_done.toggled.connect(self._done_toggled)
         tb.addAction(self.act_done)
-        a_exp = act(SP.SP_DialogSaveButton, "전체 내보내기", self.export_all,
-                    "전체를 _scanned/ 폴더에 선택한 형식으로 저장")
+        a_exp = act(SP.SP_DialogSaveButton, "내보내기", self.export_all,
+                    "선택한 사진을 _scanned/ 폴더에 저장(선택 없으면 전체)")
         btn = tb.widgetForAction(a_exp)
         if btn is not None:
             btn.setObjectName("primary")
+        # 반응형: 좁아지면 아이콘만(라벨 숨김)으로 자동 전환할 수 있게 기준폭 캡처.
+        # 텍스트 모드 sizeHint = 라벨까지 다 들어가는 최소 폭(현재 활성 스타일이라 정확).
+        self.tb = tb
+        self._tb_text_w = max(tb.sizeHint().width(), 900)
+
+    def _apply_min_width(self):
+        """아이콘만일 때 전부 들어가는 폭을 창 최소폭으로 고정 → 그 아래로는 못 줄여
+        가장 오른쪽 아이콘이 잘려 사라지는 것을 방지. show 이후 호출해야 sizeHint 가
+        스타일 변경을 반영한다(빌드 시점엔 아직 갱신 안 됨)."""
+        if getattr(self, "_min_w_set", False) or not hasattr(self, "tb"):
+            return
+        self._min_w_set = True
+        Style = QtCore.Qt.ToolButtonStyle
+        cur = self.tb.toolButtonStyle()
+        self.tb.setToolButtonStyle(Style.ToolButtonIconOnly)
+        lay = self.tb.layout()
+        if lay is not None:
+            lay.activate()
+        icon_w = self.tb.sizeHint().width()
+        self.tb.setToolButtonStyle(cur)              # 원래 스타일 복원(깜빡임 방지)
+        if lay is not None:
+            lay.activate()
+        self.setMinimumWidth(icon_w + 24)
+        self._adjust_toolbar()
+
+    def _adjust_toolbar(self):
+        """창 폭이 텍스트 모드 기준폭보다 좁으면 아이콘만, 넓으면 아이콘+텍스트.
+        기준폭은 텍스트 모드 고정값이라 모드가 바뀌어도 진동(oscillation) 없음."""
+        if not hasattr(self, "tb"):
+            return
+        Style = QtCore.Qt.ToolButtonStyle
+        want_icon = self.width() < self._tb_text_w + 16
+        style = Style.ToolButtonIconOnly if want_icon else Style.ToolButtonTextBesideIcon
+        if self.tb.toolButtonStyle() != style:
+            self.tb.setToolButtonStyle(style)
+
+    def showEvent(self, e: QtGui.QShowEvent):
+        super().showEvent(e)
+        self._apply_min_width()                      # 최초 표시 후 1회: 최소폭 확정
+
+    def resizeEvent(self, e: QtGui.QResizeEvent):
+        super().resizeEvent(e)
+        self._adjust_toolbar()
 
     def _loupe_toggled(self, on: bool):
         self.act_loupe.setText("돋보기: 켬" if on else "돋보기: 끔")
@@ -785,16 +870,34 @@ class MainWindow(QtWidgets.QMainWindow):
         s, c, g = (self.cb_sharpen.isChecked(), self.cb_contrast.isChecked(),
                    self.cb_gray.isChecked())
         rows = self._selected_rows()
-        for r in rows:
+        for r in rows:                        # 상태·배지(빠름)
             pg = self.pages[r]
             pg.sharpen, pg.contrast, pg.gray = s, c, g
             self._refresh_item(r)
-        self.update_preview()
+        self.update_preview()                 # 현재 장(빠름)
+        self._refresh_thumbs_bulk(rows)       # 비현재 장 썸네일(느림 → 많으면 진행바)
         self._update_size_estimate()
         if rows:                             # 키 토글 시 어느 옵션이 켜졌는지 피드백
             on = lambda v: "ON" if v else "off"
             self.status.showMessage(
                 f"보정 {len(rows)}장 — 샤프닝 {on(s)} · 명암 {on(c)} · 흑백 {on(g)}")
+
+    def rotate_selected(self, turns: int):
+        """선택한(없으면 현재) 사진들의 출력물을 90° 단위 회전(turns>0 시계방향).
+        미리보기·용량추정·목록 배지에 즉시 반영."""
+        rows = self._selected_rows()
+        if not rows:
+            return
+        for r in rows:                        # 상태·배지(빠름)
+            pg = self.pages[r]
+            pg.rotate = (pg.rotate + turns) % 4
+            self._refresh_item(r)
+        self.update_preview()                 # 현재 장(빠름)
+        self._refresh_thumbs_bulk(rows)       # 비현재 장 썸네일(느림 → 많으면 진행바)
+        self._update_size_estimate()
+        deg = self.pages[self.idx].rotate * 90 if 0 <= self.idx < len(self.pages) else 0
+        arrow = "↻ 시계" if turns > 0 else "↺ 반시계"
+        self.status.showMessage(f"회전 {arrow} — {len(rows)}장 · 현재 사진 {deg}°")
 
     def _sync_option_checks(self, page: Page):
         """현재 사진의 보정 상태를 체크박스에 반영(역방향 발화 없이)."""
@@ -841,9 +944,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if page is None and 0 <= self.idx < len(self.pages):
             page = self.pages[self.idx]
         if page is None:
-            return dict(sharpen=False, auto_contrast=False, grayscale=False)
+            return dict(sharpen=False, auto_contrast=False, grayscale=False,
+                        rotate=0)
         return dict(sharpen=page.sharpen, auto_contrast=page.contrast,
-                    grayscale=page.gray)
+                    grayscale=page.gray, rotate=page.rotate)
 
     def _build_shortcuts(self):
         sc = lambda key, fn: QtGui.QShortcut(QtGui.QKeySequence(key), self, fn)
@@ -858,6 +962,9 @@ class MainWindow(QtWidgets.QMainWindow):
         sc(QtCore.Qt.Key.Key_1, self.cb_sharpen.toggle)
         sc(QtCore.Qt.Key.Key_2, self.cb_contrast.toggle)
         sc(QtCore.Qt.Key.Key_3, self.cb_gray.toggle)
+        # 출력물 90° 회전(선택 사진들) — 4 반시계 / 5 시계
+        sc(QtCore.Qt.Key.Key_4, lambda: self.rotate_selected(-1))
+        sc(QtCore.Qt.Key.Key_5, lambda: self.rotate_selected(1))
 
     # ── 열기 + 사전 인식 ──
     def open_files(self):
@@ -907,7 +1014,10 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 bgr = load_image(page.path)
                 page.quad = detect_quad(bgr)
-                page.thumb = make_thumb(bgr)
+                h, w = bgr.shape[:2]
+                quad = page.quad if page.quad is not None else default_quad(w, h)
+                out = enhance(warp_for_thumb(bgr, quad), **self._enhance_opts(page))
+                page.thumb = make_thumb(out)            # 보정 결과로 미리보기
             except Exception:
                 page.quad = None
             page.label = read_label(page.path)   # 디코드 성공 여부와 무관하게 라벨 읽기
@@ -952,7 +1062,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_filter()                 # 새 항목에 현재 필터 반영
 
     def _apply_filter(self):
-        """표식 체크박스(OR)에 따라 항목 숨김/표시. pages↔row 1:1 유지, 숨김만 토글."""
+        """표식 체크박스(OR·중복선택)에 따라 항목 숨김/표시. 켜진 표식들을 함께 표시
+        (예: 미인식+인식 동시). pages↔row 1:1 유지, 숨김만 토글."""
         if not hasattr(self, "cb_f_fail"):
             return
         f_fail, f_det, f_conf = (self.cb_f_fail.isChecked(),
@@ -978,6 +1089,15 @@ class MainWindow(QtWidgets.QMainWindow):
         b.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         b.toggled.connect(self._apply_filter)  # setChecked 뒤 연결(초기 발화 방지)
         return b
+
+    def _reset_filters(self):
+        """필터 3개를 모두 켜서 전체 표시 상태로 되돌린다(원클릭)."""
+        for b in (self.cb_f_fail, self.cb_f_det, self.cb_f_conf):
+            b.blockSignals(True)
+            b.setChecked(True)
+            b.blockSignals(False)
+        self._apply_filter()
+        self.status.showMessage("필터 초기화 — 전체 표시")
 
     def select_visible(self):
         """현재 필터로 보이는 항목만 전체 선택(전체선택 버튼)."""
@@ -1007,7 +1127,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 f'🏷 {html.escape(page.label)}</div>')
         badges = ([] + (["✦샤프"] if page.sharpen else [])
                   + (["◐명암"] if page.contrast else [])
-                  + (["⬛흑백"] if page.gray else []))
+                  + (["⬛흑백"] if page.gray else [])
+                  + ([f"↻{page.rotate * 90}"] if page.rotate % 4 else []))
         if badges:                           # 켜진 보정 배지(한눈에 비교용)
             parts.append(
                 '<div style="color:#9a9a9a;font-size:11px;">'
@@ -1052,16 +1173,69 @@ class MainWindow(QtWidgets.QMainWindow):
             self.remove_selected()
 
     # ── 미리보기 ──
+    def _on_quad_changed(self):
+        """뷰의 모서리 변경 콜백. 로드 중 자동 발화(default_quad 주입 등)가 아니라
+        실제 사용자 편집일 때만 '만짐'으로 기록 → 미인식 사진이 단순 방문만으로
+        인식으로 승격되는 것을 막는다(_save_current 가드와 짝)."""
+        if not self._loading:
+            self._touched = True
+        self.update_preview()
+
     def update_preview(self):
         out = self.view.preview_image() if self.view.bgr is not None else None
         if out is None or out.size == 0:
             return
         out = enhance(out, **self._enhance_opts())  # 보정 옵션 즉시 반영
         self.preview.set_source(bgr_to_qpixmap(out))  # 크기 추종은 라벨이 알아서
+        if 0 <= self.idx < len(self.pages):           # 현재 장 썸네일도 보정결과로 실시간 갱신
+            self.pages[self.idx].thumb = make_thumb(out)
+            it = self.listw.item(self.idx)
+            if it is not None:
+                it.setIcon(self.pages[self.idx].thumb)
+
+    def _refresh_thumb_offscreen(self, i: int):
+        """현재 보고 있지 않은 페이지의 보정결과 썸네일 재생성(재로딩 필요).
+        일괄 보정·회전이 여러 장에 적용될 때 현재 장이 아닌 것들에 쓴다."""
+        if not (0 <= i < len(self.pages)):
+            return
+        page = self.pages[i]
+        try:
+            bgr = load_image(page.path)
+        except Exception:
+            return
+        h, w = bgr.shape[:2]
+        quad = page.quad if page.quad is not None else default_quad(w, h)
+        out = enhance(warp_for_thumb(bgr, quad), **self._enhance_opts(page))
+        page.thumb = make_thumb(out)
+        it = self.listw.item(i)
+        if it is not None:
+            it.setIcon(page.thumb)
+
+    def _refresh_thumbs_bulk(self, rows: list[int]):
+        """선택 여러 장의 비현재 페이지 썸네일을 재생성(각각 재로딩 → 느림).
+        장수가 많으면 진행바를 띄워 '멈춘 것처럼' 보이지 않게 한다."""
+        targets = [r for r in rows if r != self.idx]   # 현재 장은 update_preview 가 갱신
+        if not targets:
+            return
+        prog = None
+        if len(targets) >= 8:                          # 몇 장은 순식간 → 진행바 생략
+            prog = QtWidgets.QProgressDialog(
+                "보정 적용 중…", "취소", 0, len(targets), self)
+            prog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+            prog.setMinimumDuration(0)                 # 즉시 표시(짧아도 깜빡 보이게)
+        for n, r in enumerate(targets):
+            if prog is not None:
+                prog.setValue(n)
+                if prog.wasCanceled():
+                    break
+            self._refresh_thumb_offscreen(r)
+        if prog is not None:
+            prog.setValue(len(targets))
 
     # ── 네비게이션 ──
     def _save_current(self):
-        if 0 <= self.idx < len(self.pages) and self.view.bgr is not None:
+        if (0 <= self.idx < len(self.pages) and self.view.bgr is not None
+                and self._touched):
             self.pages[self.idx].quad = self.view.quad()
 
     def goto(self, row: int):
@@ -1077,6 +1251,9 @@ class MainWindow(QtWidgets.QMainWindow):
             h, w = bgr.shape[:2]
             self.view.set_quad(page.quad if page.quad is not None
                                else default_quad(w, h))
+            # 이미 quad가 있던(자동인식/이전 저장) 사진만 '의미있음'으로 출발.
+            # 미인식(None)은 사용자가 모서리를 만지기 전엔 저장 대상이 아니다.
+            self._touched = page.quad is not None
             self._sync_option_checks(page)   # 체크박스를 이 사진의 보정 상태로
             self._sync_done_action()         # 수정완료 토글 상태 동기화
             # (setCurrentRow 재호출 금지: ExtendedSelection 에서 다중선택을 지워버림.
@@ -1233,13 +1410,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.pages:
             return
         self._save_current()
-        prog = QtWidgets.QProgressDialog("내보내는 중…", "취소", 0, len(self.pages), self)
+        # 선택한 행만(없으면 전체) 내보낸다.
+        sel = sorted({ix.row() for ix in self.listw.selectedIndexes()})
+        rows = sel if sel else list(range(len(self.pages)))
+        total = len(rows)
+        prog = QtWidgets.QProgressDialog("내보내는 중…", "취소", 0, total, self)
         prog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
         done = 0
-        for i, page in enumerate(self.pages):
-            prog.setValue(i)
+        for n, i in enumerate(rows):
+            prog.setValue(n)
             if prog.wasCanceled():
                 break
+            page = self.pages[i]
             bgr = None
             try:
                 bgr = load_image(page.path)
@@ -1258,12 +1440,113 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 print("내보내기 실패:", page.path, e)
             del bgr
-        prog.setValue(len(self.pages))
-        self.status.showMessage(f"내보내기 완료: {done} / {len(self.pages)}")
+        prog.setValue(total)
+        scope = "선택" if sel else "전체"
+        self.status.showMessage(f"내보내기 완료({scope}): {done} / {total}")
         if QtGui.QGuiApplication.platformName() != "offscreen":  # selftest 에선 모달 금지
             QtWidgets.QMessageBox.information(
                 self, "완료",
-                f"내보내기 완료: {done} / {len(self.pages)}\n→ 각 사진 옆 _scanned/ 폴더")
+                f"내보내기 완료({scope}): {done} / {total}\n→ 각 사진 옆 _scanned/ 폴더")
+
+    # ── 세션(목록) 영속 ──
+    def _save_session(self):
+        """현재 목록을 JSON 으로 저장(경로·quad·확인·보정·회전·라벨). 썸네일은
+        용량/직렬화 문제로 저장하지 않고 복원 시 재생성한다."""
+        data = {"pages": [{
+            "path": pg.path,
+            "quad": pg.quad.tolist() if pg.quad is not None else None,
+            "confirmed": pg.confirmed,
+            "sharpen": pg.sharpen, "contrast": pg.contrast, "gray": pg.gray,
+            "rotate": pg.rotate, "label": pg.label,
+        } for pg in self.pages]}
+        try:
+            with open(_session_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            print("세션 저장 실패:", e)
+
+    def _restore_session(self):
+        """저장된 목록을 복원. 사라지거나 못 읽는 파일은 제외하고, 썸네일은 재로딩해 재생성."""
+        path = _session_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        items = data.get("pages", []) if isinstance(data, dict) else []
+        pages: list[Page] = []
+        for d in items:
+            p = d.get("path")
+            if not p or not os.path.isfile(p):
+                continue
+            pg = Page(p)
+            q = d.get("quad")
+            pg.quad = np.array(q, dtype=np.float32) if q else None
+            pg.confirmed = bool(d.get("confirmed"))
+            pg.sharpen = bool(d.get("sharpen"))
+            pg.contrast = bool(d.get("contrast"))
+            pg.gray = bool(d.get("gray"))
+            pg.rotate = int(d.get("rotate", 0)) % 4
+            pg.label = d.get("label")
+            pages.append(pg)
+        if not pages:
+            return
+        prog = QtWidgets.QProgressDialog("이전 목록 복원 중…", "취소", 0, len(pages), self)
+        prog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        good: list[Page] = []
+        for i, pg in enumerate(pages):
+            prog.setValue(i)
+            if prog.wasCanceled():
+                good.extend(pages[i:])        # 취소는 '제외'가 아님 — 남은 건 그대로 유지
+                break
+            try:
+                bgr = load_image(pg.path)
+                h, w = bgr.shape[:2]
+                quad = pg.quad if pg.quad is not None else default_quad(w, h)
+                out = enhance(warp_for_thumb(bgr, quad), **self._enhance_opts(pg))
+                pg.thumb = make_thumb(out)
+                good.append(pg)
+            except Exception:
+                pass                          # 못 읽는(손상) 파일은 복원 목록에서 제외
+        prog.setValue(len(pages))
+        if not good:
+            return
+        self.pages = good
+        self.idx = -1
+        self._rebuild_list()
+        self.listw.setCurrentRow(0)
+        skipped = len(items) - len(good)
+        msg = f"이전 목록 복원: {len(self.pages)}장"
+        if skipped:
+            msg += f" (사라지거나 못 읽는 파일 {skipped}장 제외)"
+        self.status.showMessage(msg)
+
+    def _new_session(self):
+        """목록을 비우고 새 작업 시작. 빈 세션을 저장해 다음 실행 때 복원하지 않는다."""
+        if self.pages:
+            r = QtWidgets.QMessageBox.question(
+                self, "새로 시작", "현재 목록을 비우고 새로 시작할까요?")
+            if r != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        self.pages = []
+        self.idx = -1
+        self._touched = False
+        self.view.bgr = None
+        self.view.scene().clear()
+        self.view.handles = []
+        self.view._place_nav()
+        self.preview._src = None
+        self.preview.setText("(사진을 여세요)")
+        self.listw.clear()
+        self._save_session()                 # 빈 목록 저장 → 다음 실행 시 복원 없음
+        self.status.showMessage("새로 시작 — 목록을 비웠습니다.")
+
+    def closeEvent(self, e: QtGui.QCloseEvent):
+        self._save_current()
+        self._save_session()
+        super().closeEvent(e)
 
 
 def apply_dark(app: QtWidgets.QApplication):
@@ -1327,15 +1610,19 @@ def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--selftest":
         sys.exit(_selftest(sys.argv[2]))
     app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("PhotoScanner")   # AppData 세션 경로 결정에 사용
     apply_dark(app)
     w = MainWindow()
+    w.show()
+    loaded = False
     if len(sys.argv) >= 2:
         arg = sys.argv[1]
         if os.path.isdir(arg):
-            w._load_paths(_folder_images(arg))
+            w._load_paths(_folder_images(arg)); loaded = True
         elif os.path.isfile(arg):
-            w._load_paths([arg])
-    w.show()
+            w._load_paths([arg]); loaded = True
+    if not loaded:                           # 인자 없이 실행 → 지난 목록 자동 복원
+        w._restore_session()
     sys.exit(app.exec())
 
 

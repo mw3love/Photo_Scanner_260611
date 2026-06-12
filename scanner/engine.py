@@ -135,8 +135,12 @@ def warp(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
 # ── 후처리(보정 품질) ───────────────────────────────────────────────────────
 
 def enhance(image: np.ndarray, *, sharpen: bool = False,
-            auto_contrast: bool = False, grayscale: bool = False) -> np.ndarray:
-    """선택적 후처리. 순서: 그레이스케일 → 명암 보정 → 샤프닝."""
+            auto_contrast: bool = False, grayscale: bool = False,
+            rotate: int = 0) -> np.ndarray:
+    """선택적 후처리. 순서: 그레이스케일 → 명암 보정 → 샤프닝 → 회전.
+
+    rotate 는 시계방향 90° 단위(quarter turn) 횟수(0~3). cv2.rotate 는 픽셀을
+    재배열만 하므로 화질 손실이 없다."""
     out = image
     if grayscale:
         g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
@@ -153,4 +157,9 @@ def enhance(image: np.ndarray, *, sharpen: bool = False,
     if sharpen:
         blur = cv2.GaussianBlur(out, (0, 0), 2.0)
         out = cv2.addWeighted(out, 1.5, blur, -0.5, 0)  # 언샤프 마스크
+    if rotate % 4:
+        code = {1: cv2.ROTATE_90_CLOCKWISE,
+                2: cv2.ROTATE_180,
+                3: cv2.ROTATE_90_COUNTERCLOCKWISE}[rotate % 4]
+        out = cv2.rotate(out, code)
     return out
